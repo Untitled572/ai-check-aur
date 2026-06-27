@@ -1,0 +1,103 @@
+#!/bin/bash
+
+CACHE_DIR="${HOME}/.cache/ai-check-aur"
+CACHE_FILE="${CACHE_DIR}/cache"
+LOG_FILE="${CACHE_DIR}/audit.log"
+TIMEOUT=60
+MODEL="opencode/deepseek-v4-flash-free"
+
+mkdir -p "$CACHE_DIR"
+ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+# [1] Pre-checks
+if ! command -v opencode &>/dev/null; then
+  echo "[ai-check] WARNING: opencode not found, skip" >&2
+  echo "[$ts] ${PKGBASE:-unknown} ${VERSION:-unknown} ERROR: opencode not found" >> "$LOG_FILE"
+  exit 0
+fi
+
+if [ ! -f "PKGBUILD" ]; then
+  echo "[ai-check] WARNING: PKGBUILD not found in $(pwd), skip" >&2
+  echo "[$ts] ${PKGBASE:-unknown} ${VERSION:-unknown} ERROR: PKGBUILD not found" >> "$LOG_FILE"
+  exit 0
+fi
+
+# [2] Cache check
+if [ -n "$PKGBASE" ] && [ -n "$VERSION" ]; then
+  if grep -qs "^${PKGBASE}:${VERSION}$" "$CACHE_FILE" 2>/dev/null; then
+    echo "[ai-check] $PKGBASE: cached, skip"
+    echo "[$ts] $PKGBASE $VERSION SKIP: cache hit" >> "$LOG_FILE"
+    exit 0
+  fi
+fi
+
+# [3] Read PKGBUILD
+pkgbuild_content=$(cat PKGBUILD)
+
+# [4] Build prompt
+read -r -d '' prompt << PROMPT_EOF || true
+你是一个 Arch Linux 安全审查专家。请严格审查以下 PKGBUILD 文件是否存在安全风险。
+
+检查要点（包括但不限于）：
+1. source=() 中是否包含不可信 URL（如 pastebin、raw GitHub gist、短链接、未知 IP）
+2. 是否在 build()/package() 中执行 curl/wget 并 pipe 到 shell
+3. 是否下载并执行预编译的二进制文件且无完整性校验
+4. validpgpkeys 是否缺失、过期、或与实际 source 不匹配
+5. install 脚本是否包含危险的 post_install 操作（如修改系统文件、添加定时任务）
+6. 是否有隐藏的后门代码（如向远程服务器发送数据、修改 ~/.ssh/authorized_keys 等）
+7. 依赖是否包含可疑包
+
+如果完全安全，只输出一行：PASS
+如果发现任何风险，只输出一行：FAIL: <具体风险描述>
+
+不要输出任何其他内容。
+
+PKGBUILD：
+${pkgbuild_content}
+PROMPT_EOF
+
+echo "[ai-check] 正在审查 ${PKGBASE:-unknown} ..."
+
+tmpf=$(mktemp /tmp/ai-check-aur.XXXXXX)
+printf '%s\n' "$prompt" > "$tmpf"
+
+set +e
+result=$(timeout $TIMEOUT opencode run --model "$MODEL" "$(cat "$tmpf")" 2>/dev/null)
+ec=$?
+set -e
+rm -f "$tmpf"
+
+# [5] Parse result
+result_lower=$(echo "$result" | tr '[:upper:]' '[:lower:]')
+
+if [ $ec -ne 0 ]; then
+  echo "[ai-check] WARNING: opencode call failed (exit $ec), skip" >&2
+  echo "[$ts] ${PKGBASE:-unknown} ${VERSION:-unknown} ERROR: opencode exit $ec" >> "$LOG_FILE"
+  exit 0
+fi
+
+if [ -z "$result" ]; then
+  echo "[ai-check] WARNING: empty response, skip" >&2
+  echo "[$ts] ${PKGBASE:-unknown} ${VERSION:-unknown} ERROR: empty response" >> "$LOG_FILE"
+  exit 0
+fi
+
+if echo "$result_lower" | grep -q "^pass"; then
+  echo "[ai-check] $PKGBASE: 通过审查"
+  echo "${PKGBASE}:${VERSION}" >> "$CACHE_FILE" 2>/dev/null
+  echo "[$ts] $PKGBASE $VERSION PASS" >> "$LOG_FILE"
+  exit 0
+fi
+
+if echo "$result_lower" | grep -qE "^(fail|失败|风险)"; then
+  echo "[ai-check] 发现安全风险: $PKGBASE" >&2
+  echo "────────────────────────────────────────────" >&2
+  echo "$result" >&2
+  echo "────────────────────────────────────────────" >&2
+  echo "[$ts] $PKGBASE $VERSION FAIL: $result" >> "$LOG_FILE"
+  exit 1
+fi
+
+echo "[ai-check] WARNING: 无法解析结果（${result:0:80}），放行" >&2
+echo "[$ts] ${PKGBASE:-unknown} ${VERSION:-unknown} UNPARSABLE: $result" >> "$LOG_FILE"
+exit 0
