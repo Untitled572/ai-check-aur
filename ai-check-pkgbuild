@@ -3,13 +3,56 @@
 CACHE_DIR="${HOME}/.cache/ai-check-aur"
 CACHE_FILE="${CACHE_DIR}/cache"
 LOG_FILE="${CACHE_DIR}/audit.log"
-TIMEOUT=60
-MODEL="opencode/deepseek-v4-flash-free"
+DEFAULT_TIMEOUT=60
+DEFAULT_MODEL="opencode/deepseek-v4-flash-free"
+DEFAULT_FAIL_ACTION="skip"
+
+# Capture environment variables BEFORE config file loading
+ORIG_ENABLED="${AI_CHECK_ENABLED:-}"
+ORIG_MODEL="${AI_CHECK_MODEL:-}"
+ORIG_TIMEOUT="${AI_CHECK_TIMEOUT:-}"
+ORIG_FAIL_ACTION="${AI_CHECK_FAIL_ACTION:-}"
+
+# [0] Load config
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_DIRS=(
+  "$SCRIPT_DIR"
+  "${XDG_CONFIG_HOME:-$HOME/.config}/ai-check-aur"
+)
+CONFIG_FILE=""
+for dir in "${CONFIG_DIRS[@]}"; do
+  if [ -f "$dir/config.env" ]; then
+    CONFIG_FILE="$dir/config.env"
+    break
+  fi
+done
+
+# Apply defaults
+AI_CHECK_ENABLED=true
+AI_CHECK_MODEL="$DEFAULT_MODEL"
+AI_CHECK_TIMEOUT="$DEFAULT_TIMEOUT"
+AI_CHECK_FAIL_ACTION="$DEFAULT_FAIL_ACTION"
+
+if [ -n "$CONFIG_FILE" ]; then
+  # shellcheck source=config.env
+  source "$CONFIG_FILE"
+fi
+
+# Environment variables take precedence over config file
+[ -n "$ORIG_ENABLED" ] && AI_CHECK_ENABLED="$ORIG_ENABLED"
+[ -n "$ORIG_MODEL" ] && AI_CHECK_MODEL="$ORIG_MODEL"
+[ -n "$ORIG_TIMEOUT" ] && AI_CHECK_TIMEOUT="$ORIG_TIMEOUT"
+[ -n "$ORIG_FAIL_ACTION" ] && AI_CHECK_FAIL_ACTION="$ORIG_FAIL_ACTION"
 
 mkdir -p "$CACHE_DIR"
 ts=$(date '+%Y-%m-%d %H:%M:%S')
 
-# [1] Pre-checks
+# [1] Enabled check
+if [ "$AI_CHECK_ENABLED" != "true" ]; then
+  exit 0
+fi
+
+# [2] Pre-checks
 if ! command -v opencode &>/dev/null; then
   echo "[ai-check] WARNING: opencode not found, skip" >&2
   echo "[$ts] ${PKGBASE:-unknown} ${VERSION:-unknown} ERROR: opencode not found" >> "$LOG_FILE"
@@ -22,7 +65,7 @@ if [ ! -f "PKGBUILD" ]; then
   exit 0
 fi
 
-# [2] Cache check
+# [3] Cache check
 if [ -n "$PKGBASE" ] && [ -n "$VERSION" ]; then
   if grep -qs "^${PKGBASE}:${VERSION}$" "$CACHE_FILE" 2>/dev/null; then
     echo "[ai-check] $PKGBASE: cached, skip"
@@ -31,26 +74,30 @@ if [ -n "$PKGBASE" ] && [ -n "$VERSION" ]; then
   fi
 fi
 
-# [3] Read PKGBUILD
+# [4] Read PKGBUILD
 pkgbuild_content=$(cat PKGBUILD)
 
-# [4] Build prompt
+# [5] Build prompt
 read -r -d '' prompt << PROMPT_EOF || true
 你是一个 Arch Linux 安全审查专家。请严格审查以下 PKGBUILD 文件是否存在安全风险。
 
-检查要点（包括但不限于）：
-1. source=() 中是否包含不可信 URL（如 pastebin、raw GitHub gist、短链接、未知 IP）
-2. 是否在 build()/package() 中执行 curl/wget 并 pipe 到 shell
-3. 是否下载并执行预编译的二进制文件且无完整性校验
-4. validpgpkeys 是否缺失、过期、或与实际 source 不匹配
-5. install 脚本是否包含危险的 post_install 操作（如修改系统文件、添加定时任务）
-6. 是否有隐藏的后门代码（如向远程服务器发送数据、修改 ~/.ssh/authorized_keys 等）
-7. 依赖是否包含可疑包
+重要：以下情况不算风险，不要标记为 FAIL：
+- source 中使用 example.com、localhost、0.0.0.0 等保留域名
+- sha256sums 为 'SKIP'（这是正常用法）
+- validpgpkeys 缺失（不是每个包都需要签名）
+- 依赖声明缺失（这不是安全问题）
+- 标准的 ./configure && make && make install 模式
 
-如果完全安全，只输出一行：PASS
-如果发现任何风险，只输出一行：FAIL: <具体风险描述>
+以下情况才标记为 FAIL：
+- source 中包含 pastebin、raw GitHub gist、hastebin 等临时粘贴服务 URL
+- build/package 函数中执行 curl/wget 并 pipe 到 shell（curl | bash 模式）
+- 下载并执行预编译二进制但没有 checksum 校验
+- install 脚本中修改 /etc/passwd、/etc/shadow、authorized_keys、crontab 等敏感文件
+- 向外部服务器发送数据（外联行为）
+- 隐藏后门代码
 
-不要输出任何其他内容。
+如果安全，只输出一行：PASS
+如果发现风险，只输出一行：FAIL: <具体风险描述>
 
 PKGBUILD：
 ${pkgbuild_content}
@@ -62,12 +109,12 @@ tmpf=$(mktemp /tmp/ai-check-aur.XXXXXX)
 printf '%s\n' "$prompt" > "$tmpf"
 
 set +e
-result=$(timeout $TIMEOUT opencode run --model "$MODEL" "$(cat "$tmpf")" 2>/dev/null)
+result=$(timeout "$AI_CHECK_TIMEOUT" opencode run --model "$AI_CHECK_MODEL" "$(cat "$tmpf")" 2>/dev/null)
 ec=$?
 set -e
 rm -f "$tmpf"
 
-# [5] Parse result
+# [6] Parse result
 result_lower=$(echo "$result" | tr '[:upper:]' '[:lower:]')
 
 if [ $ec -ne 0 ]; then
@@ -90,12 +137,27 @@ if echo "$result_lower" | grep -q "^pass"; then
 fi
 
 if echo "$result_lower" | grep -qE "^(fail|失败|风险)"; then
-  echo "[ai-check] 发现安全风险: $PKGBASE" >&2
-  echo "────────────────────────────────────────────" >&2
-  echo "$result" >&2
-  echo "────────────────────────────────────────────" >&2
-  echo "[$ts] $PKGBASE $VERSION FAIL: $result" >> "$LOG_FILE"
-  exit 1
+  case "$AI_CHECK_FAIL_ACTION" in
+    block)
+      echo "[ai-check] 发现安全风险: $PKGBASE" >&2
+      echo "────────────────────────────────────────────" >&2
+      echo "$result" >&2
+      echo "────────────────────────────────────────────" >&2
+      echo "[$ts] $PKGBASE $VERSION FAIL: $result" >> "$LOG_FILE"
+      exit 1
+      ;;
+    skip)
+      echo "[ai-check] 已跳过: $PKGBASE" >&2
+      echo "[$ts] $PKGBASE $VERSION SKIP: fail_action=skip" >> "$LOG_FILE"
+      exit 1
+      ;;
+    warn|*)
+      echo "[ai-check] WARNING: $PKGBASE 存在风险，允许安装" >&2
+      echo "$result" >&2
+      echo "[$ts] $PKGBASE $VERSION WARN: $result" >> "$LOG_FILE"
+      exit 0
+      ;;
+  esac
 fi
 
 echo "[ai-check] WARNING: 无法解析结果（${result:0:80}），放行" >&2
